@@ -3,6 +3,7 @@
 const { globMatch } = require('../src/util')
 const RateLimiter = require('./rate_limiter')
 const Sampler = require('./sampler')
+const { getPendingResource } = require('./sampling-resource')
 
 /**
  * Typedefs for clarity when matching spans.
@@ -167,7 +168,8 @@ function serviceLocator (span) {
 function resourceLocator (span) {
   const context = span.context()
   return context.getTag('resource') ||
-    context.getTag('resource.name')
+    context.getTag('resource.name') ||
+    getPendingResource(span)
 }
 
 /**

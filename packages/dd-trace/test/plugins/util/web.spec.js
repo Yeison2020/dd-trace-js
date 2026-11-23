@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict')
 
-const { describe, it, beforeEach } = require('mocha')
+const { describe, it, beforeEach, afterEach } = require('mocha')
 const sinon = require('sinon')
 
 require('../../setup/core')
@@ -13,6 +13,7 @@ const {
   INSTRUMENTATION_HTTP_RESOURCE,
 } = require('../../../src/plugins/util/http-otel-semantics')
 const PrioritySampler = require('../../../src/priority_sampler')
+const DatabasePlugin = require('../../../src/plugins/database')
 
 const ERROR = tagsExt.ERROR
 const HTTP_CLIENT_IP = tagsExt.HTTP_CLIENT_IP
@@ -22,6 +23,7 @@ const HTTP_RESPONSE_HEADERS = tagsExt.HTTP_RESPONSE_HEADERS
 const HTTP_ROUTE = tagsExt.HTTP_ROUTE
 const RESOURCE_NAME = tagsExt.RESOURCE_NAME
 const USER_KEEP = priority.USER_KEEP
+const USER_REJECT = priority.USER_REJECT
 
 describe('plugins/util/web', () => {
   let web
@@ -916,6 +918,129 @@ describe('plugins/util/web', () => {
       web.finishAll(web.getContext(req))
 
       assert.strictEqual(tags[RESOURCE_NAME], 'user-resource')
+    })
+  })
+
+  describe('resource sampling rules before finish', () => {
+    // An outbound request or DBM comment makes the sampling decision while the handler runs, before
+    // `finishSpan` writes `resource.name`. The rule must still see the resource the request will get.
+    let context
+    let prioritySampler
+
+    beforeEach(() => {
+      prioritySampler = new PrioritySampler('test', {
+        sampleRate: 0,
+        rules: [{ sampleRate: 1, resource: 'GET /users/:id' }],
+      })
+    })
+
+    it('matches the resource of a route set before finish', () => {
+      span = web.startSpan(tracer, config, req, res, 'test.request')
+      tags = span.context().getTags()
+      context = web.getContext(req)
+
+      web.setRoute(req, '/users/:id')
+      prioritySampler.sample(span.context())
+
+      assert.strictEqual(span.context()._sampling.priority, USER_KEEP)
+      assert.strictEqual(tags[RESOURCE_NAME], undefined)
+      assert.strictEqual(tags[HTTP_ROUTE], undefined)
+
+      web.finishAll(context)
+
+      assert.strictEqual(tags[RESOURCE_NAME], 'GET /users/:id')
+      assert.strictEqual(tags[HTTP_ROUTE], '/users/:id')
+    })
+
+    it('matches the resource of a route assembled from entered segments', () => {
+      prioritySampler = new PrioritySampler('test', {
+        sampleRate: 0,
+        rules: [{ sampleRate: 1, resource: 'GET /api/users/:id' }],
+      })
+      span = web.startSpan(tracer, config, req, res, 'test.request')
+
+      web.enterRoute(req, '/api')
+      web.enterRoute(req, '/users/:id')
+      prioritySampler.sample(span.context())
+
+      assert.strictEqual(span.context()._sampling.priority, USER_KEEP)
+    })
+
+    it('matches an http.route already on the span', () => {
+      span = web.startSpan(tracer, config, req, res, 'test.request')
+      span.setTag(HTTP_ROUTE, '/users/:id')
+
+      prioritySampler.sample(span.context())
+
+      assert.strictEqual(span.context()._sampling.priority, USER_KEEP)
+    })
+
+    it('does not match while the route is unknown', () => {
+      prioritySampler = new PrioritySampler('test', {
+        sampleRate: 0,
+        rules: [{ sampleRate: 1, resource: 'GET*' }],
+      })
+      span = web.startSpan(tracer, config, req, res, 'test.request')
+
+      prioritySampler.sample(span.context())
+
+      assert.strictEqual(span.context()._sampling.priority, USER_REJECT)
+    })
+
+    it('prefers a resource set on the span', () => {
+      span = web.startSpan(tracer, config, req, res, 'test.request')
+      span.setTag(RESOURCE_NAME, 'user-resource')
+
+      web.setRoute(req, '/users/:id')
+      prioritySampler.sample(span.context())
+
+      assert.strictEqual(span.context()._sampling.priority, USER_REJECT)
+    })
+
+    it('does not match spans that are not request roots', () => {
+      web.startSpan(tracer, config, req, res, 'test.request')
+      web.setRoute(req, '/users/:id')
+      span = tracer.startSpan('other.root')
+
+      prioritySampler.sample(span.context())
+
+      assert.strictEqual(span.context()._sampling.priority, USER_REJECT)
+    })
+
+    describe('through the tracer sampler', () => {
+      let tracerSampler
+
+      beforeEach(() => {
+        tracerSampler = tracer._tracer._prioritySampler
+        tracerSampler.configure('test', { sampleRate: 0, rules: [{ sampleRate: 1, resource: 'GET /users/:id' }] })
+      })
+
+      afterEach(() => {
+        tracerSampler.configure('test', tracer._tracer._config.sampler)
+      })
+
+      it('applies the rule when an outbound request injects the trace context', () => {
+        span = web.startSpan(tracer, config, req, res, 'test.request')
+        web.setRoute(req, '/users/:id')
+        const carrier = {}
+
+        tracer.inject(span, 'http_headers', carrier)
+
+        assert.strictEqual(carrier['x-datadog-sampling-priority'], String(USER_KEEP))
+      })
+
+      it('applies the rule when a DBM full-mode comment carries the trace context', () => {
+        span = web.startSpan(tracer, config, req, res, 'test.request')
+        web.setRoute(req, '/users/:id')
+        const query = tracer.startSpan('pg.query', { childOf: span })
+        const plugin = new DatabasePlugin(tracer, {})
+        plugin.configure({ dbmPropagationMode: 'full', enabled: true })
+
+        const comment = plugin.createDbmComment(query, 'postgres')
+
+        assert.match(comment, /traceparent='00-[\da-f]{32}-[\da-f]{16}-01'/)
+        assert.strictEqual(span.context()._sampling.priority, USER_KEEP)
+      })
     })
   })
 

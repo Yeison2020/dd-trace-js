@@ -8,6 +8,7 @@ const tags = require('../../../../../ext/tags')
 const types = require('../../../../../ext/types')
 const kinds = require('../../../../../ext/kinds')
 const { ERROR_MESSAGE } = require('../../constants')
+const { setPendingResourceProvider } = require('../../sampling-resource')
 const TracingPlugin = require('../tracing')
 const { storage } = require('../../../../datadog-core')
 const legacyStorage = storage('legacy')
@@ -42,6 +43,8 @@ const HTTP_CLIENT_IP = tags.HTTP_CLIENT_IP
 const MANUAL_DROP = tags.MANUAL_DROP
 
 const contexts = new WeakMap()
+// Request root span -> web context, for sampling decisions made before the span finishes.
+const rootContexts = new WeakMap()
 
 // TODO: change this to no longer rely on creating a dummy plugin to be able to access startSpan
 function createWebPlugin (tracer, config = {}) {
@@ -135,6 +138,7 @@ const web = {
     context.tracer = tracer
     context.span = span
     context.res = res
+    rootContexts.set(span, context)
 
     this.setConfig(req, config)
     addRequestTags(context, this.TYPE)
@@ -348,6 +352,7 @@ const web = {
 
     context.span.finish()
     context.finished = true
+    rootContexts.delete(context.span)
   },
 
   finishAll (context, spanType) {
@@ -595,9 +600,7 @@ function applyRouteOrEndpointTag (context) {
   // again. http.route is terminal once set; nothing supersedes it.
   if (spanContext.hasTag(HTTP_ROUTE)) return
 
-  // Skip the `Array.prototype.join` builtin in the empty / single-segment
-  // cases; `paths[0]` covers both (`undefined` is falsy for the empty case).
-  const route = paths.length > 1 ? paths.join('') : paths[0]
+  const route = routeFromPaths(paths)
 
   if (route) {
     // A framework route supersedes any http.endpoint fallback a pre-finish
@@ -624,6 +627,35 @@ function ownsResource (spanContext) {
     spanContext.getTag(INSTRUMENTATION_HTTP_RESOURCE)
   )
 }
+
+/**
+ * @param {string[]} paths
+ */
+function routeFromPaths (paths) {
+  // Skip the `Array.prototype.join` builtin in the empty / single-segment
+  // cases; `paths[0]` covers both (`undefined` is falsy for the empty case).
+  return paths.length > 1 ? paths.join('') : paths[0]
+}
+
+/**
+ * The resource `addResourceTag` would set if the request finished now, or `undefined` while the route is
+ * unknown. The sampler only asks when the span has no resource yet; with OTel semantics `startSpan` already
+ * sets one, so only the default naming is needed here. Without a route the final resource is the bare
+ * method, which is not returned so that method-only rules cannot match a request before it is routed. A
+ * decision made here is final, so a route that is still being resolved (a router mount prefix) or a
+ * resource renamed later by `hooks.request` is not reflected.
+ *
+ * @param {import('../../opentracing/span')} span
+ */
+function pendingResource (span) {
+  const context = rootContexts.get(span)
+  if (!context) return
+
+  const route = span.context().getTag(HTTP_ROUTE) ?? routeFromPaths(context.paths)
+  return route ? `${context.req.method} ${route}` : undefined
+}
+
+setPendingResourceProvider(pendingResource)
 
 function addResourceTag (context) {
   const { req, span, config } = context
